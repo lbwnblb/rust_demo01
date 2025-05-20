@@ -5,7 +5,7 @@ use tungstenite::{accept, Message};
 
 fn main() {
     // 创建TCP监听器，绑定到本地9001端口
-    let server = TcpListener::bind("127.0.0.1:9001").unwrap();
+    let server = TcpListener::bind("0.0.0.0:9001").unwrap();
     println!("WebSocket服务器已启动，监听端口9001");
 
     // 处理连接

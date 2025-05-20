@@ -18,7 +18,7 @@ fn main() {
     writeln!(handle, "正在连接到服务器...").unwrap();
     
     // 连接到服务器（增加代理支持）
-    let url = Url::parse("ws://127.0.0.1:9001").unwrap();
+    let url = Url::parse("ws://43.167.220.84:9001").unwrap();
     
     // 代理设置（增加代理支持，无需认证）
     let proxy_url = "http://127.0.0.1:7890";
