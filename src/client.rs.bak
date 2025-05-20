@@ -1,0 +1,314 @@
+use std::io::{self, Write};
+use std::thread;
+use std::sync::Arc;
+use std::sync::Mutex;
+use tungstenite::Message;
+use url::Url;
+use std::time::Duration;
+use std::env;
+use clap::{Arg, Command};
+
+// tokio相关依赖
+use tokio::net::TcpStream;
+use tokio::runtime::Runtime;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::WebSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::{SinkExt, StreamExt};
+
+// 配置结构体
+struct Config {
+    server_url: String,       // WebSocket服务器地址
+    use_proxy: bool,          // 是否使用代理
+    proxy_url: Option<String>, // 代理服务器地址
+}
+
+// 通过代理连接到目标服务器
+async fn connect_via_proxy(proxy_url_str: &str, target_host: &str, target_port: u16) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    println!("使用代理: {}", proxy_url_str);
+    
+    // 解析代理URL
+    let proxy_url = Url::parse(proxy_url_str)?;
+    let proxy_host = proxy_url.host_str().unwrap_or("127.0.0.1");
+    let proxy_port = proxy_url.port().unwrap_or(7890);
+    
+    println!("代理服务器: {}:{}", proxy_host, proxy_port);
+    
+    // 连接到代理服务器
+    println!("正在连接到代理服务器...");
+    let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
+    let mut tcp_stream = TcpStream::connect(proxy_addr).await?;
+    
+    // 如果是HTTP代理，发送CONNECT请求
+    if proxy_url.scheme() == "http" || proxy_url.scheme() == "https" {
+        println!("使用HTTP(S)代理，发送CONNECT请求");
+        
+        // 目标地址
+        let target_addr = format!("{}:{}", target_host, target_port);
+        
+        // 构建CONNECT请求
+        let connect_req = format!(
+            "CONNECT {} HTTP/1.1\r\n\
+            Host: {}\r\n\
+            User-Agent: rustws-client\r\n\
+            Proxy-Connection: Keep-Alive\r\n\r\n",
+            target_addr, target_addr
+        );
+        
+        // 发送CONNECT请求
+        tcp_stream.write_all(connect_req.as_bytes()).await?;
+        
+        // 读取代理服务器的响应
+        let mut response_buf = [0; 1024];
+        let n = tcp_stream.read(&mut response_buf).await?;
+        let response_text = String::from_utf8_lossy(&response_buf[..n]);
+        println!("代理响应: {}", response_text);
+        
+        // 检查代理服务器是否同意连接
+        if !response_text.contains("200") {
+            return Err(format!("代理服务器拒绝连接: {}", response_text).into());
+        }
+        
+        println!("CONNECT请求成功，代理服务器已建立连接到目标服务器");
+    } else if proxy_url.scheme() == "socks5" {
+        // 如果是SOCKS5代理，可以添加SOCKS5代理支持
+        // 这里需要使用tokio-socks库
+        return Err("SOCKS5代理目前不支持".into());
+    } else {
+        return Err(format!("不支持的代理协议: {}", proxy_url.scheme()).into());
+    }
+    
+    Ok(tcp_stream)
+}
+
+// 连接到WebSocket服务器
+async fn connect_to_server(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse(&config.server_url)?;    println!("连接到WebSocket服务器: {}", url);        // 解析目标主机和端口 - 对wss使用443端口，ws使用80端口    let host = url.host_str().unwrap_or("localhost");    let port = if url.scheme() == "wss" {        url.port().unwrap_or(443)    } else {        url.port().unwrap_or(80)    };    println!("目标主机: {}:{}", host, port);
+    
+    // 决定是否使用代理
+    let tcp_stream = if config.use_proxy {
+        if let Some(proxy_url_str) = &config.proxy_url {
+            // 使用代理连接
+            connect_via_proxy(proxy_url_str, host, port).await?
+        } else {
+            return Err("启用了代理但未提供代理地址".into());
+        }
+    } else {
+        // 直接连接
+        println!("直接连接到WebSocket服务器...");
+        let server_addr = format!("{}:{}", host, port);
+        TcpStream::connect(server_addr).await?
+    };
+    
+    // 在连接上进行WebSocket握手
+    println!("开始WebSocket握手...");
+    
+    // 构造WebSocket升级请求
+    let ws_key = tungstenite::handshake::client::generate_key();
+    let path = url.path();
+    let path_query = if let Some(query) = url.query() {
+        format!("{}?{}", path, query)
+    } else {
+        path.to_string()
+    };
+    
+    // 如果路径为空，使用/作为默认路径
+    let path_query = if path_query.is_empty() { "/" } else { &path_query };
+    
+    println!("WebSocket路径: {}", path_query);
+    
+    let request = format!(
+        "GET {} HTTP/1.1\r\n\
+        Host: {}:{}\r\n\
+        Connection: Upgrade\r\n\
+        Upgrade: websocket\r\n\
+        Sec-WebSocket-Version: 13\r\n\
+        Sec-WebSocket-Key: {}\r\n\
+        Origin: http://{}:{}\r\n\r\n",
+        path_query, host, port, ws_key, host, port
+    );
+    
+    println!("发送的WebSocket握手请求:\n{}", request);
+    
+    // 执行WebSocket握手
+    let mut tcp_stream = tcp_stream;
+    tcp_stream.write_all(request.as_bytes()).await?;
+    
+    // 读取WebSocket握手响应
+    let mut response_buf = [0; 2048];
+    let n = tcp_stream.read(&mut response_buf).await?;
+    let response_text = String::from_utf8_lossy(&response_buf[..n]);
+    println!("WebSocket握手响应: {}", response_text);
+    
+    // 检查握手是否成功 - 不区分大小写
+    let response_lower = response_text.to_lowercase();
+    
+    // 打印更详细的响应分析
+    println!("响应状态码检查: {}", response_lower.contains("101"));
+    println!("响应升级检查: {}", response_lower.contains("upgrade"));
+    println!("响应协议切换检查: {}", response_lower.contains("switching protocols"));
+    
+    // 更宽松的检查 - 只要状态码为101即可
+    if !response_lower.contains("101") {
+        return Err(format!("WebSocket握手失败，响应内容：\n{}", response_text).into());
+    }
+    
+    println!("WebSocket握手成功，连接已建立！");
+    
+    // 使用tokio-tungstenite的WebSocketStream包装TCP流
+    let ws_stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        tcp_stream, 
+        tokio_tungstenite::tungstenite::protocol::Role::Client,
+        None
+    ).await;
+    
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    
+    // 发送几条测试消息
+    for i in 1..4 {
+        let test_msg = format!("测试消息 {}", i);
+        println!("发送测试消息: {}", test_msg);
+        
+        ws_sender.send(Message::Text(test_msg)).await?;
+        println!("测试消息发送成功!");
+        
+        // 等待服务器响应
+        if let Some(result) = ws_receiver.next().await {
+            match result {
+                Ok(msg) => {
+                    match msg {
+                        Message::Text(text) => println!("收到服务器响应: {}", text),
+                        Message::Binary(data) => println!("收到二进制数据, 长度: {} 字节", data.len()),
+                        Message::Close(_) => {
+                            println!("服务器关闭了连接");
+                            return Ok(());
+                        },
+                        _ => println!("收到其他类型消息: {:?}", msg),
+                    }
+                },
+                Err(e) => {
+                    println!("接收消息错误: {:?}", e);
+                    return Err(e.into());
+                }
+            }
+        } else {
+            println!("WebSocket连接关闭");
+            return Ok(());
+        }
+        
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    
+    println!("你可以开始发送消息了，输入 'exit' 退出");
+    
+    // 启动一个异步任务来接收消息
+    let receive_task = tokio::spawn(async move {
+        while let Some(result) = ws_receiver.next().await {
+            match result {
+                Ok(msg) => {
+                    match msg {
+                        Message::Text(text) => println!("收到消息: {}", text),
+                        Message::Binary(data) => println!("收到二进制数据, 长度: {} 字节", data.len()),
+                        Message::Close(_) => {
+                            println!("服务器关闭了连接");
+                            break;
+                        },
+                        _ => println!("收到其他类型消息: {:?}", msg),
+                    }
+                },
+                Err(e) => {
+                    println!("接收消息错误: {:?}", e);
+                    break;
+                }
+            }
+        }
+    });
+    
+    // 主循环处理用户输入
+    loop {
+        // 提示用户输入
+        print!("> ");
+        io::stdout().flush().unwrap();
+        
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        
+        // 去除尾部换行符
+        let input = input.trim();
+        
+        if input == "exit" {
+            // 发送关闭消息
+            println!("退出命令，准备关闭连接");
+            if let Err(e) = ws_sender.send(Message::Close(None)).await {
+                println!("发送关闭消息失败: {:?}", e);
+            }
+            break;
+        } else if !input.is_empty() {
+            // 发送文本消息
+            println!("发送消息: {}", input);
+            if let Err(e) = ws_sender.send(Message::Text(input.to_string())).await {
+                println!("发送消息错误: {:?}", e);
+                break;
+            } else {
+                println!("消息发送成功!");
+            }
+        }
+    }
+    
+    // 等待接收任务完成
+    if let Err(e) = receive_task.await {
+        println!("接收任务异常终止: {:?}", e);
+    }
+    
+    println!("客户端已关闭");
+    Ok(())
+}
+
+fn main() {
+    // 使用clap进行命令行参数解析
+    let matches = Command::new("WebSocket客户端")
+        .version("1.0")
+        .about("WebSocket客户端，支持直连和代理连接")
+        .arg(Arg::new("url")
+            .short('u')
+            .long("url")
+            .help("WebSocket服务器地址")
+            .default_value("wss://fstream.binance.com/ws/bnbusdt@aggTrade"))
+        .arg(Arg::new("proxy")
+            .short('p')
+            .long("proxy")
+            .help("代理服务器地址 (http://host:port)")
+            .default_value("http://127.0.0.1:7890"))
+        .arg(Arg::new("no-proxy")
+            .long("no-proxy")
+            .help("不使用代理，直接连接")
+            .action(clap::ArgAction::SetTrue))
+        .get_matches();
+    // 配置初始化 - 默认禁用代理
+    let mut config = Config {
+        server_url: matches.get_one::<String>("url").unwrap().clone(),
+        use_proxy: false, // 直接在这里设置为false，默认不使用代理
+        proxy_url: None,
+    };
+    
+    // 如果命令行中显式指定了使用代理（没有--no-proxy参数），则启用代理
+    if !matches.get_flag("no-proxy") {
+        config.use_proxy = true;
+        config.proxy_url = Some(matches.get_one::<String>("proxy").unwrap().clone());
+    }
+
+    // 打印配置信息
+    println!("WebSocket客户端启动中...");
+    println!("服务器地址: {}", config.server_url);
+    println!("代理状态: {}", if config.use_proxy { "启用" } else { "禁用" });
+    if let Some(proxy) = &config.proxy_url {
+        println!("代理地址: {}", proxy);
+    }
+    
+    // 创建一个tokio运行时来支持异步操作
+    let rt = Runtime::new().unwrap();
+    
+    // 在tokio运行时中执行所有异步操作
+    if let Err(e) = rt.block_on(connect_to_server(&config)) {
+        eprintln!("错误: {}", e);
+    }
+} 
